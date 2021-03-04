@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+  </head>
+  <body>
+    <div>Welcome to SheetyDapp!<div>
+    <div id="status"> </div>
+    <iframe id="url-wallet" style="position:fixed; top:0; left:0; bottom:0; right:0; width:0%; height:0%; border:none; margin:0; padding:0; overflow:hidden; z-index:999999;"></iframe>
+  </body>
+    <script src="https://cdn.jsdelivr.net/gh/Gilg4mesh/urlwallet-sdk@0.1.4/dist/urlwallet-sdk.min.js"></script>
+    <?!= include('src/eventEmitter.js')?>
+    <script>
+      document.getElementById("status").innerHTML = "<br>Connecting..."
+
+      // the container should NOT react to Metamask events
+      if (typeof ethereum !== 'undefined' && 'autoRefreshOnNetworkChange' in ethereum) {
+        ethereum.autoRefreshOnNetworkChange = false
+      }
+            
+      const ifr = document.getElementById('url-wallet')
+      const urlWallet = new UrlWalletSDK(ifr)
+      window._web3 = urlWallet.web3 // connected web3
+
+      console.log('provider', urlWallet.ethProvider)
+      console.log('connected web3', _web3)
+      console.log('web3 current provider', _web3.currentProvider)
+
+      urlWallet.ethProvider.on('initialized', port => {
+        main()
+      })
+
+      urlWallet.ethProvider.on('window_blocked', port => {
+        console.error('pop-up window is blocked (message from dapp)')
+      })
+
+      urlWallet.ethProvider.on('initiateFailure', resp => {
+        console.error('init failed: ' + resp.msg)
+      })
+
+      const url = new URL('https://sheetdapp.netlify.app/iframe.html')
+      urlWallet.dispose()
+      urlWallet.start(url.href, url.origin)
+      
+     // TODO
+     // batch request
+     // multicall
+      window.app = {};
+      window.tick = 0;
+      window.app.event = new EventEmitter();
+      window.app.events = {};
+      window.contract = {};
+      // TODO load config data, check debug mode is open
+      async function main() {
+        try {
+          // load app config first
+          window.app.config = JSON.parse(await retryServerCall(0, "readConfig"));
+          console.log(window.app.config)
+
+          await init();
+
+          await initContract();
+          
+          // TODO on block
+          await update();
+          if (!!window.app.config.polling) {
+            console.log("Start polling");
+            setInterval(update, +window.app.config.pollingInterval);
+          }
+          
+          app.event.on('write', async (index, source) => {
+            console.log(source)
+            console.log('write time baby')
+            const writeData = await retryServerCall(0, "getWriteDataByIndex", index);
+            console.log(writeData);
+            const result = await promiseCall(writeData.functionName, writeData.args);
+            await retryServerCall(0, "setWriteResultByIndex", writeData, result, source); 
+          });
+          
+          (async ()=> {
+            while (1) {
+              try {
+                await syncEventEmitter();
+                // no await for heartbeat
+                retryServerCall(0, "heartbeat", window.tick, window.app.config.emitterPollingInterval);
+                window.tick++;
+                await sleep(+window.app.config.emitterPollingInterval); 
+              } catch(e){
+                console.log('polling error', e);
+              }
+            }
+          })();
+          await retryServerCall(0, "afterConnect");
+          document.getElementById("status").innerHTML = "<br>Successfully connected!<br><br> Do not close this window or you need to re-connect it again."
+        }
+        catch (e) {
+          console.error(e);
+        }
+      }
+      
+      async function syncEventEmitter() {
+        const event = await retryServerCall(0, "eventEmitterRead");
+        for (const uuid of Object.keys(event.emit)) {
+          if (Object.keys(app.events).indexOf(uuid) === -1) {
+            app.events[uuid] = 1;
+            app.event.emit(event.emit[uuid].key, event.emit[uuid].value, event.emit[uuid].source);
+            const result = await retryServerCall(0, "eventEmitterDelete", uuid);
+            if (result) delete app.events[uuid];
+          }
+        }
+      }
+      
+      // TODO: Support NETWORK_ONLY_MODE
+      async function init() {
+        const chainId = await promiseCall("web3.eth.getChainId");
+        app.chainId = chainId;
+        console.log("chainId: ", chainId);
+        
+        let currentAddress = await urlWallet.getCurrentAddress();
+        if (currentAddress === null) {
+          console.warn('No addresses found. Trying to request from the provider...');
+          const accounts = await urlWallet.requestAccounts(true);
+          currentAddress = (accounts.length != 0) ? accounts[0]: null;
+        }
+        
+        if (currentAddress) {
+          _web3.eth.defaultAccount = currentAddress;
+          app.currentAddress = currentAddress;
+          console.log("currentAddress: ", currentAddress);
+        } else {
+          throw new Error('Cannot init URL wallet: Failed to request the active account from the iframe.');
+        }
+
+        const result = await retryServerCall(0, "setReadListResult", ['chainId', 'account'], [chainId, currentAddress]);
+      }
+      
+      function formatString(_object) {
+        const originalType = typeof _object;
+        // if type is string, trim first
+        if (originalType === 'number') {
+          return _object;
+        }
+        
+        if (originalType === 'string') {
+          _object = _object.trim(); // trim space
+          _object = _object.replace(/\t/g, '');
+          _object = _object.replace(/\r/g, '');
+          _object = _object.replace(/\n/g, '');
+        }
+
+        if (originalType === 'string' && RegExp('^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)$').test(_object)) {
+          return _object;
+        }
+                
+        // check is JSON
+        let _json = undefined;
+        try {
+          _json = JSON.parse(_object);
+        } catch (e) {
+          ;
+        }
+        
+        // fix string number after json.parse be pure number
+        if (originalType === "string" && typeof _json === 'number') {
+          return _json.toString();
+        } else if (_json === undefined) {
+          return _object;
+        }
+
+        return _json;
+      }
+      
+      // Modify
+      async function initContract() {
+        const contractList = JSON.parse(await retryServerCall(0 , "getContractList"));
+        contractList.forEach((contractData) => {
+          contract[formatString(contractData.name)] = new _web3.eth.Contract(formatString(contractData.abi), formatString(contractData.address));
+        });
+      }
+      
+      function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+      }
+            
+      async function update() {
+        console.log("start update");
+        const readList = await retryServerCall(0, "getReadList");
+        console.log(readList)
+        const resultList = await Promise.all(readList.map((readData) => promiseCall(readData.functionName, readData.args)));
+        const keyList = readList.map((readData) => readData.key);
+        console.log(resultList, keyList)
+        const result = await retryServerCall(0, "setReadListResult", keyList, resultList);
+      }      
+  
+      function promiseCall(functionName, args) {
+        var context = window
+        // patch web3 lib name
+        functionName = functionName.replace("web3.", "_web3.");
+        var namespaces = functionName.split(".");
+        var func = namespaces.pop();
+        for(var i = 0; i < namespaces.length; i++) {
+          context = context[namespaces[i]];
+        }
+        
+        // TODO trim \t \n bugs
+        let _args = JSON.parse(JSON.stringify(args ?? []));
+        _args = _args.map((arg)=> {
+          return formatString(arg);
+        })
+
+        // check has contract methods function 
+        let methodsFunctionIndex = -1;
+        let methodsFunctionName = undefined;
+        let methodsFunctionArgs = [];
+        const supportedMethodsFunctionNameList = [".call", ".send", ".estimateGas"];
+        for (const methodFunctionName of  supportedMethodsFunctionNameList) {
+          const methodIndex = _args.indexOf(methodFunctionName);
+          if (methodIndex !== -1) {
+            methodsFunctionIndex = methodIndex;
+            const _methodsFunctionArgs = _args.slice(methodsFunctionIndex+1);
+            _args = _args.slice(0, methodsFunctionIndex);
+            methodsFunctionArgs.push(_methodsFunctionArgs.length > 0 ? _methodsFunctionArgs[0] : null); // options
+            if (methodFunctionName === ".call") {
+              methodsFunctionName = "call";
+              methodsFunctionArgs.push(_methodsFunctionArgs.length > 0 ? _methodsFunctionArgs[0] : null); // defaultBlock
+            }
+            else if (methodFunctionName === ".send") {
+              methodsFunctionName = "send";
+            } 
+            else if (methodFunctionName === ".estimateGas") {
+              methodsFunctionName = "estimateGas";
+            }
+            break;
+          }
+        }
+
+        return new Promise(function(resolve, reject) {
+          const callback = (error, result) => {
+              if (error) {
+                console.error("promiseCall", error);
+                // TODO handle revert or user cancel case
+                // reject(error);
+                resolve(-1);
+              } else {
+                if (result._ethersType && result._ethersType === 'BigNumber') {
+                  resolve(result.toString());
+                } else {
+                  resolve(result);
+                }
+              }
+            }
+            
+          if (methodsFunctionIndex === -1) {
+            _args.push(callback)
+            context[func].apply(context, _args)
+          } else {           
+            methodsFunctionArgs.push(callback)
+            context[func].apply(context, _args)[methodsFunctionName].apply(null, methodsFunctionArgs)
+          }
+        })
+      }
+      
+
+      function serverCall(functionName /*, args */) {
+        console.log("serverCall", functionName)
+        const args = Array.prototype.slice.call(arguments, 1);
+        return new Promise(function(resolve, reject) { 
+          google.script.run
+          .withFailureHandler((error) => {
+            console.log("serverCall error", error.message);
+            reject(error);
+          })
+          .withSuccessHandler((result) => {
+            resolve(result);
+          })
+          [functionName].apply(google.script.run, args);
+        })
+      }
+
+      const retryTimes = 5;
+      async function retryServerCall(i, functionName /*, args */) {
+        const args = Array.prototype.slice.call(arguments, 2);
+        try {
+          return await serverCall(functionName, ...args);
+        } catch (e) {
+          if (i < retryTimes) {
+            return await retryServerCall(i+1, functionName, ...args);
+          } else {
+            throw e;
+          }
+        }
+      }
+    </script>
+</html>
